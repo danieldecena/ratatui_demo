@@ -32,28 +32,37 @@ Requires a recent stable Rust toolchain (install via <https://rustup.rs>).
 | `↑ ↓` / scroll      | Adjust the active tab                               |
 | click a row         | Select it (List, Table, System)                     |
 | `Enter`             | Open a details popup (List / Table / System)        |
+| `s`                 | Cycle process sort: CPU → Mem → Name → PID (System) |
+| `/`                 | Filter processes by name (System); `Esc` to finish  |
 | `k`                 | Kill the selected process (System tab; confirms)    |
+| `+` / `-`           | Faster / slower refresh rate                         |
 | `t`                 | Cycle color theme                                   |
 | `?`                 | Toggle help                                         |
 | `r`                 | Reset the counter                                   |
 | `q` / `Esc`         | Close a popup, or quit                              |
 
+Your theme, last tab, sort key, and refresh rate are **persisted** to a small
+config file and restored next launch.
+
 ## System monitor
 
 The **System** tab reads live stats via [`sysinfo`](https://crates.io/crates/sysinfo):
-overall CPU and memory gauges, one `LineGauge` per core, a rolling CPU-history
-sparkline, and a scrollable table of every process sorted by CPU. Select a process
-and press `Enter` for its details (PID, CPU%, memory, status, uptime) or `k` to kill
-it after a confirmation prompt. Stats refresh ~every 240ms.
+a color-coded CPU gauge (green → yellow → red), memory and swap gauges, live
+network (↓/↑) and disk (R/W) I/O rates, one `LineGauge` per core, a rolling
+CPU-history sparkline, and a scrollable, sortable, filterable table of every
+process with a scrollbar. Select a process and press
+`Enter` for its details (PID, CPU%, memory, status, uptime) or `k` to kill it after
+a confirmation prompt.
 
 ## Project layout
 
 ```
 src/
-  main.rs    terminal setup + teardown
-  app.rs     application state, drawing, and tests
-  theme.rs   color palettes
-  popup.rs   help / detail / confirm modals
+  main.rs        terminal setup + teardown, panic-safe restore
+  app.rs         application state, input → Action → update, config, tests
+  app/render.rs  all tab rendering (draw_* methods)
+  theme.rs       color palettes
+  popup.rs       help / detail / confirm modals
 ```
 
 ## Tests

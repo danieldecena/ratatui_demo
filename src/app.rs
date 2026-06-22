@@ -1,25 +1,22 @@
 use std::time::{Duration, Instant};
 
 use ratatui::{
+    DefaultTerminal,
     crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEventKind},
-    layout::{Alignment, Constraint, Layout, Rect},
-    style::{Color, Modifier, Style, Stylize},
-    symbols,
-    text::{Line, Span},
-    widgets::{
-        canvas::{Canvas, Circle, Map, MapResolution},
-        Axis, Block, BorderType, Borders, Cell, Chart, Dataset, Gauge, GraphType, LineGauge, List,
-        ListItem, ListState, Paragraph, Row, Sparkline, Table, TableState, Tabs,
-    },
-    DefaultTerminal, Frame,
+    layout::Rect,
+    style::Color,
+    widgets::{ListState, TableState},
 };
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::Pid;
 
-use crate::popup;
-use crate::theme::{Theme, THEMES};
+mod render;
 
-const TAB_TITLES: [&str; 7] = [
-    "Counter", "List", "Table", "Chart", "Live", "Canvas", "System",
+use crate::claude::data::*;
+use crate::data::*;
+use crate::theme::{THEMES, Theme};
+
+const TAB_TITLES: [&str; 8] = [
+    "Counter", "List", "Table", "Chart", "Live", "Canvas", "System", "Claude",
 ];
 
 // (widget, kind, stateful) — shared by the table view and the detail popup.
@@ -41,17 +38,65 @@ fn fmt_duration(secs: u64) -> String {
     format!("{h}h {m}m {s}s")
 }
 
-/// A snapshot of one process row, kept so the detail popup can read the selection.
-#[derive(Clone)]
-struct ProcRow {
-    pid: String,
-    pid_num: u32,
-    name: String,
-    cpu: f32,
-    mem: u64,
-    run: u64,
-    status: String,
+/// Human-readable byte rate, e.g. "1.2 MB/s".
+fn fmt_rate(bytes_per_sec: u64) -> String {
+    let b = bytes_per_sec as f64;
+    if b >= 1_000_000_000.0 {
+        format!("{:.1} GB/s", b / 1_000_000_000.0)
+    } else if b >= 1_000_000.0 {
+        format!("{:.1} MB/s", b / 1_000_000.0)
+    } else if b >= 1_000.0 {
+        format!("{:.0} KB/s", b / 1_000.0)
+    } else {
+        format!("{b:.0} B/s")
+    }
 }
+
+/// Color a load percentage: green (calm) → yellow (busy) → red (hot).
+fn load_color(theme: &Theme, pct: f64) -> Color {
+    if pct >= 80.0 {
+        Color::Red
+    } else if pct >= 50.0 {
+        Color::Yellow
+    } else {
+        theme.series
+    }
+}
+
+/// How the process table is sorted.
+
+const REFRESH_MIN_MS: u64 = 40;
+const REFRESH_MAX_MS: u64 = 1000;
+
+/// A user intent, decoded from input and applied in `App::update`. Decoupling
+/// "what the user meant" from "how it was entered" keeps logic testable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Action {
+    QuitOrClose,
+    NextTab,
+    PrevTab,
+    ClickTab(u16),
+    ClickBody(u16, u16),
+    Up,
+    Down,
+    OpenDetail,
+    ToggleHelp,
+    ShowPalette,
+    CycleTheme,
+    ResetCounter,
+    FasterRefresh,
+    SlowerRefresh,
+    CycleSort,
+    StartFilter,
+    FilterChar(char),
+    FilterBackspace,
+    EndFilter,
+    RequestKill,
+    ConfirmKill,
+    CancelKill,
+}
+
+/// A snapshot of one process row, kept so the detail popup can read the selection.
 
 pub struct App {
     tab: usize,
@@ -59,20 +104,30 @@ pub struct App {
     show_help: bool,
     detail: Option<String>, // when Some, a detail popup is shown
     counter: i64,
-    items: Vec<&'static str>,
+    items: Vec<String>,
     list_state: ListState,
     table_state: TableState,
     spark: Vec<u64>,
     tick: u64,
     body: Rect, // area of the active tab's body, for mouse hit-testing
-    sys: System,
-    cpu_history: Vec<u64>,
+    pub monitor: SysMonitor,
     proc_state: TableState,
-    proc_count: usize, // rows currently shown, for selection clamping
+    proc_count: usize,           // rows currently shown, for selection clamping
     proc_snapshot: Vec<ProcRow>, // last-drawn process list, for the detail popup
-    proc_area: Rect,   // rect of the process table, for mouse hit-testing
+    proc_area: Rect,             // rect of the process table, for mouse hit-testing
     pending_kill: Option<(u32, String)>, // (pid, name) awaiting confirmation
+    sort_by: SortKey,
+    filter: String,
+    filtering: bool,             // true while typing in the filter box
+    refresh_ms: u64,             // tick / refresh interval
+    tab_ranges: Vec<(u16, u16)>, // x-ranges of each tab title, for click hit-testing
     exit: bool,
+    claude_history: Vec<ClaudeHistoryRow>,
+    claude_state: ListState,
+    claude_stats: Option<ClaudeStats>,
+    tcp_sockets: Vec<SocketRow>,
+    show_palette: bool,
+    palette_input: String,
 }
 
 impl App {
@@ -81,57 +136,135 @@ impl App {
         list_state.select(Some(0));
         let mut table_state = TableState::default();
         table_state.select(Some(0));
+        let mut files = vec!["..".to_string()];
+        if let Ok(entries) = std::fs::read_dir(".") {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let prefix = if is_dir { "📁 " } else { "📄 " };
+                files.push(format!("{}{}", prefix, name));
+            }
+        }
+        files.sort();
+
         Self {
             tab: 0,
             theme_idx: 0,
             show_help: false,
             detail: None,
             counter: 0,
-            items: vec![
-                "Layout — split the screen into regions",
-                "Block — borders, titles, padding",
-                "Paragraph — wrapped, styled text",
-                "List — scrollable, selectable rows",
-                "Table — columns and headers",
-                "Gauge — progress bars",
-                "Chart — line and scatter plots",
-                "Tabs — switch between views",
-                "Sparkline — compact trend lines",
-                "Canvas — draw shapes and maps",
-            ],
+            items: files,
             list_state,
             table_state,
             spark: vec![0; 80],
             tick: 0,
             body: Rect::new(0, 0, 0, 0),
-            sys: System::new_all(),
-            cpu_history: vec![0; 60],
+            monitor: SysMonitor::new(),
             proc_state: TableState::default().with_selected(Some(0)),
             proc_count: 0,
             proc_snapshot: Vec::new(),
             proc_area: Rect::new(0, 0, 0, 0),
             pending_kill: None,
+            sort_by: SortKey::Cpu,
+            filter: String::new(),
+            filtering: false,
+            refresh_ms: 120,
+            tab_ranges: Vec::new(),
             exit: false,
+            claude_history: load_history(),
+            claude_state: ListState::default(),
+            claude_stats: load_stats(),
+            tcp_sockets: get_tcp_sockets(),
+            show_palette: false,
+            palette_input: String::new(),
         }
+    }
+
+    /// Path to the persisted config file, if a config dir is available.
+    fn config_path() -> Option<std::path::PathBuf> {
+        directories::ProjectDirs::from("", "", "ratatui_demo")
+            .map(|d| d.config_dir().join("config"))
+    }
+
+    /// Load persisted UI preferences (theme, tab, sort, refresh). Best-effort.
+    pub fn load_config(&mut self) {
+        let Some(path) = Self::config_path() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            match (k.trim(), v.trim()) {
+                ("theme", v) => {
+                    if let Ok(i) = v.parse::<usize>() {
+                        self.theme_idx = i % THEMES.len();
+                    }
+                }
+                ("tab", v) => {
+                    if let Ok(i) = v.parse::<usize>() {
+                        self.tab = i % TAB_TITLES.len();
+                    }
+                }
+                ("sort", v) => {
+                    if let Ok(i) = v.parse::<usize>() {
+                        self.sort_by = SortKey::from_index(i);
+                    }
+                }
+                ("refresh", v) => {
+                    if let Ok(ms) = v.parse::<u64>() {
+                        self.refresh_ms = ms.clamp(REFRESH_MIN_MS, REFRESH_MAX_MS);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Persist UI preferences. Best-effort; errors are ignored.
+    pub fn save_config(&self) {
+        let Some(path) = Self::config_path() else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let body = format!(
+            "theme={}\ntab={}\nsort={}\nrefresh={}\n",
+            self.theme_idx,
+            self.tab,
+            self.sort_by.to_index(),
+            self.refresh_ms,
+        );
+        let _ = std::fs::write(path, body);
     }
 
     fn theme(&self) -> &Theme {
         &THEMES[self.theme_idx]
     }
 
-    pub fn run(&mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
-        let tick_rate = Duration::from_millis(120);
-        let mut last_tick = Instant::now();
+    pub async fn run(&mut self, mut terminal: ratatui::DefaultTerminal) -> std::io::Result<()> {
+        use futures::StreamExt;
+        use ratatui::crossterm::event::EventStream;
+        use std::time::Duration;
+        use tokio::time::interval;
+
+        let mut ticker = interval(Duration::from_millis(self.refresh_ms));
+        let mut events = EventStream::new();
+
         while !self.exit {
             terminal.draw(|frame| self.draw(frame))?;
 
-            let timeout = tick_rate.saturating_sub(last_tick.elapsed());
-            if event::poll(timeout)? {
-                self.handle_event(event::read()?);
-            }
-            if last_tick.elapsed() >= tick_rate {
-                self.on_tick();
-                last_tick = Instant::now();
+            tokio::select! {
+                _ = ticker.tick() => {
+                    self.on_tick();
+                }
+                Some(Ok(event)) = events.next() => {
+                    self.handle_event(event);
+                }
             }
         }
         Ok(())
@@ -146,70 +279,138 @@ impl App {
 
         // Refresh real system stats every other tick (~240ms — above sysinfo's
         // minimum CPU sampling interval for accurate readings).
-        if self.tick % 2 == 0 {
-            self.sys.refresh_cpu_usage();
-            self.sys.refresh_memory();
-            let cpu = self.sys.global_cpu_usage().round().clamp(0.0, 100.0) as u64;
-            self.cpu_history.remove(0);
-            self.cpu_history.push(cpu);
-            if self.tab == 6 {
-                self.sys.refresh_processes(ProcessesToUpdate::All, true);
-            }
+        self.monitor.tick(self.tick, self.refresh_ms, self.tab == 6);
+    }
+
+    /// Translate a raw event into an `Action`, then apply it (Elm-style).
+    fn handle_event(&mut self, ev: Event) {
+        if let Some(action) = self.map_event(ev) {
+            self.update(action);
         }
     }
 
-    fn handle_event(&mut self, ev: Event) {
-        // A kill confirmation captures all keys until resolved.
-        if self.pending_kill.is_some() {
-            if let Event::Key(key) = ev {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_kill(),
-                        _ => self.pending_kill = None, // anything else cancels
-                    }
-                }
+    /// Pure-ish mapping from input event to intent, aware of modal state.
+    fn map_event(&mut self, ev: Event) -> Option<Action> {
+        let Event::Key(key) = ev else {
+            // Mouse events (no modal interception needed here).
+            if let Event::Mouse(m) = ev {
+                return match m.kind {
+                    MouseEventKind::ScrollUp => Some(Action::Up),
+                    MouseEventKind::ScrollDown => Some(Action::Down),
+                    MouseEventKind::Down(_) if m.row <= 2 => Some(Action::ClickTab(m.column)),
+                    MouseEventKind::Down(_) => Some(Action::ClickBody(m.column, m.row)),
+                    _ => None,
+                };
             }
-            return;
+            return None;
+        };
+        if key.kind != KeyEventKind::Press {
+            return None;
         }
 
-        match ev {
-            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    // Close any open popup first; only quit if nothing is open.
-                    if self.detail.is_some() {
-                        self.detail = None;
-                    } else if self.show_help {
-                        self.show_help = false;
-                    } else {
-                        self.exit = true;
-                    }
+        // Modal: kill confirmation captures all keys.
+        if self.pending_kill.is_some() {
+            return Some(match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => Action::ConfirmKill,
+                _ => Action::CancelKill,
+            });
+        }
+        // Modal: filter box captures typing.
+
+        if self.show_palette {
+            match key.code {
+                KeyCode::Esc => {
+                    self.show_palette = false;
+                    self.palette_input.clear();
                 }
-                KeyCode::Enter => self.open_detail(),
-                KeyCode::Char('?') => self.show_help = !self.show_help,
-                KeyCode::Char('t') => self.theme_idx = (self.theme_idx + 1) % THEMES.len(),
-                KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.next_tab(),
-                KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => self.prev_tab(),
-                KeyCode::Up => self.on_up(),
-                KeyCode::Down | KeyCode::Char('j') => self.on_down(),
-                // 'k' kills on the System tab, otherwise it's vim-style "up".
-                KeyCode::Char('k') => {
-                    if self.tab == 6 {
-                        self.request_kill();
-                    } else {
-                        self.on_up();
-                    }
+                KeyCode::Enter => {
+                    let cmd = self.palette_input.clone();
+                    self.show_palette = false;
+                    self.palette_input.clear();
+                    self.execute_command(&cmd);
                 }
-                KeyCode::Char('r') => self.counter = 0,
+                KeyCode::Backspace => {
+                    self.palette_input.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.palette_input.push(c);
+                }
                 _ => {}
-            },
-            Event::Mouse(m) => match m.kind {
-                MouseEventKind::ScrollUp => self.on_up(),
-                MouseEventKind::ScrollDown => self.on_down(),
-                MouseEventKind::Down(_) if m.row <= 2 => self.next_tab(),
-                MouseEventKind::Down(_) => self.select_at(m.column, m.row),
-                _ => {}
-            },
-            _ => {}
+            }
+            return None;
+        }
+
+        if self.filtering {
+            return match key.code {
+                KeyCode::Enter | KeyCode::Esc => Some(Action::EndFilter),
+                KeyCode::Backspace => Some(Action::FilterBackspace),
+                KeyCode::Char(c) => Some(Action::FilterChar(c)),
+                _ => None,
+            };
+        }
+
+        Some(match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => Action::QuitOrClose,
+            KeyCode::Enter => Action::OpenDetail,
+            KeyCode::Char('?') => Action::ToggleHelp,
+            KeyCode::Char(':') => Action::ShowPalette,
+            KeyCode::Char('t') => Action::CycleTheme,
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => Action::NextTab,
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => Action::PrevTab,
+            KeyCode::Up => Action::Up,
+            KeyCode::Down | KeyCode::Char('j') => Action::Down,
+            // 'k' kills on the System tab, otherwise it's vim-style "up".
+            KeyCode::Char('k') if self.tab == 6 => Action::RequestKill,
+            KeyCode::Char('k') => Action::Up,
+            KeyCode::Char('r') => Action::ResetCounter,
+            KeyCode::Char('+') | KeyCode::Char('=') => Action::FasterRefresh,
+            KeyCode::Char('-') | KeyCode::Char('_') => Action::SlowerRefresh,
+            KeyCode::Char('s') if self.tab == 6 => Action::CycleSort,
+            KeyCode::Char('/') if self.tab == 6 => Action::StartFilter,
+            _ => return None,
+        })
+    }
+
+    /// Apply an `Action` to the state. The single place mutations happen.
+    fn update(&mut self, action: Action) {
+        match action {
+            Action::QuitOrClose => {
+                // Close any open popup first; only quit if nothing is open.
+                if self.detail.is_some() {
+                    self.detail = None;
+                } else if self.show_help {
+                    self.show_help = false;
+                } else {
+                    self.exit = true;
+                }
+            }
+            Action::NextTab => self.next_tab(),
+            Action::PrevTab => self.prev_tab(),
+            Action::ClickTab(col) => self.select_tab_at(col),
+            Action::ClickBody(col, row) => self.select_at(col, row),
+            Action::Up => self.on_up(),
+            Action::Down => self.on_down(),
+            Action::OpenDetail => self.open_detail(),
+            Action::ToggleHelp => self.show_help = !self.show_help,
+            Action::ShowPalette => self.show_palette = true,
+            Action::CycleTheme => self.theme_idx = (self.theme_idx + 1) % THEMES.len(),
+            Action::ResetCounter => self.counter = 0,
+            Action::FasterRefresh => {
+                self.refresh_ms = self.refresh_ms.saturating_sub(20).max(REFRESH_MIN_MS);
+            }
+            Action::SlowerRefresh => {
+                self.refresh_ms = (self.refresh_ms + 20).min(REFRESH_MAX_MS);
+            }
+            Action::CycleSort => self.sort_by = self.sort_by.next(),
+            Action::StartFilter => self.filtering = true,
+            Action::FilterChar(c) => self.filter.push(c),
+            Action::FilterBackspace => {
+                self.filter.pop();
+            }
+            Action::EndFilter => self.filtering = false,
+            Action::RequestKill => self.request_kill(),
+            Action::ConfirmKill => self.confirm_kill(),
+            Action::CancelKill => self.pending_kill = None,
         }
     }
 
@@ -225,6 +426,17 @@ impl App {
     }
     fn prev_tab(&mut self) {
         self.tab = (self.tab + TAB_TITLES.len() - 1) % TAB_TITLES.len();
+    }
+
+    /// Select the tab whose title range contains `col`; fall back to advancing.
+    fn select_tab_at(&mut self, col: u16) {
+        for (i, &(start, end)) in self.tab_ranges.iter().enumerate() {
+            if col >= start && col < end {
+                self.tab = i;
+                return;
+            }
+        }
+        self.next_tab();
     }
 
     fn on_up(&mut self) {
@@ -253,6 +465,42 @@ impl App {
     }
 
     /// Open a detail popup for the currently selected List/Table row.
+
+    fn execute_command(&mut self, cmd: &str) {
+        let parts: Vec<&str> = cmd.trim().split_whitespace().collect();
+        if parts.is_empty() {
+            return;
+        }
+
+        match parts[0] {
+            "quit" | "q" | "exit" => self.exit = true,
+            "theme" => {
+                if parts.len() > 1 {
+                    // super basic theme switching
+                    self.theme_idx = (self.theme_idx + 1) % crate::theme::THEMES.len();
+                }
+            }
+            "killall" => {
+                if parts.len() > 1 {
+                    let _ = std::process::Command::new("killall")
+                        .arg("-9")
+                        .arg(parts[1])
+                        .output();
+                }
+            }
+            "tab" => {
+                if parts.len() > 1 {
+                    if let Ok(idx) = parts[1].parse::<usize>() {
+                        if idx < TAB_TITLES.len() {
+                            self.tab = idx;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn open_detail(&mut self) {
         self.detail = match self.tab {
             1 => self
@@ -270,14 +518,35 @@ impl App {
                 .selected()
                 .and_then(|i| self.proc_snapshot.get(i))
                 .map(|p| {
+                    let mut extra_info = String::new();
+                    // Grab open files using lsof
+                    if let Ok(output) = std::process::Command::new("lsof")
+                        .arg("-p")
+                        .arg(&p.pid)
+                        .output() 
+                    {
+                        if output.status.success() {
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            // just take the first 10 lines so the modal doesn't explode
+                            let lines: Vec<&str> = stdout.lines().take(15).collect();
+                            extra_info = format!("\nOpen Files (lsof):\n{}", lines.join("\n"));
+                            if stdout.lines().count() > 15 {
+                                extra_info.push_str("\n... (truncated)");
+                            }
+                        } else {
+                            extra_info = "\nOpen Files (lsof): Permission denied or unavailable.".to_string();
+                        }
+                    }
+
                     format!(
-                        "{}  (pid {})\n\nCPU:     {:.1}%\nMemory:  {:.1} MB\nStatus:  {}\nUptime:  {}\n\n(press Esc or Enter to close)",
+                        "{}  (pid {})\n\nCPU:     {:.1}%\nMemory:  {:.1} MB\nStatus:  {}\nUptime:  {}\n{}\n\n(press Esc or Enter to close)",
                         p.name,
                         p.pid,
                         p.cpu,
                         p.mem as f64 / 1_000_000.0,
                         p.status,
                         fmt_duration(p.run),
+                        extra_info
                     )
                 }),
             _ => None,
@@ -286,23 +555,22 @@ impl App {
 
     /// Ask to kill the selected process (opens a confirmation prompt).
     fn request_kill(&mut self) {
-        if self.tab == 6 {
-            if let Some(p) = self
+        if self.tab == 6
+            && let Some(p) = self
                 .proc_state
                 .selected()
                 .and_then(|i| self.proc_snapshot.get(i))
-            {
-                self.pending_kill = Some((p.pid_num, p.name.clone()));
-            }
+        {
+            self.pending_kill = Some((p.pid_num, p.name.clone()));
         }
     }
 
     /// Carry out a confirmed kill.
     fn confirm_kill(&mut self) {
-        if let Some((pid, _)) = self.pending_kill.take() {
-            if let Some(proc) = self.sys.process(Pid::from_u32(pid)) {
-                proc.kill();
-            }
+        if let Some((pid, _)) = self.pending_kill.take()
+            && let Some(proc) = self.monitor.sys.process(Pid::from_u32(pid))
+        {
+            proc.kill();
         }
     }
 
@@ -346,369 +614,12 @@ impl App {
             _ => {}
         }
     }
-
-    fn draw(&mut self, frame: &mut Frame) {
-        let chunks = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(3),
-        ])
-        .split(frame.area());
-
-        self.body = chunks[1]; // remember body area for mouse hit-testing
-        self.draw_tabs(frame, chunks[0]);
-        match self.tab {
-            0 => self.draw_counter(frame, chunks[1]),
-            1 => self.draw_list(frame, chunks[1]),
-            2 => self.draw_table(frame, chunks[1]),
-            3 => self.draw_chart(frame, chunks[1]),
-            4 => self.draw_live(frame, chunks[1]),
-            5 => self.draw_canvas(frame, chunks[1]),
-            _ => self.draw_system(frame, chunks[1]),
-        }
-        self.draw_footer(frame, chunks[2]);
-
-        if let Some((pid, name)) = &self.pending_kill {
-            let prompt = format!("Kill {name} (pid {pid})?");
-            popup::render_confirm(frame, self.theme(), &prompt);
-        } else if let Some(body) = &self.detail {
-            popup::render_detail(frame, self.theme(), body);
-        } else if self.show_help {
-            popup::render_help(frame, self.theme());
-        }
-    }
-
-    fn draw_tabs(&self, frame: &mut Frame, area: Rect) {
-        let theme = self.theme();
-        let title = format!(" Ratatui Dashboard — {} theme ", theme.name);
-        let tabs = Tabs::new(TAB_TITLES.iter().map(|t| Line::from(*t)))
-            .select(self.tab)
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .block(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(theme.accent)),
-            );
-        frame.render_widget(tabs, area);
-    }
-
-    fn draw_counter(&self, frame: &mut Frame, area: Rect) {
-        let theme = self.theme();
-        let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
-        let counter = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                format!("{}", self.counter),
-                Style::default().fg(theme.value).add_modifier(Modifier::BOLD),
-            ))
-            .alignment(Alignment::Center),
-        ])
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .title(" Counter ")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
-        );
-        frame.render_widget(counter, rows[0]);
-
-        let ratio = ((self.counter.rem_euclid(21)) as f64) / 20.0;
-        let gauge = Gauge::default()
-            .block(Block::default().title(" Progress ").borders(Borders::ALL))
-            .gauge_style(Style::default().fg(theme.series))
-            .ratio(ratio);
-        frame.render_widget(gauge, rows[1]);
-    }
-
-    fn draw_list(&mut self, frame: &mut Frame, area: Rect) {
-        let theme = *self.theme();
-        let items: Vec<ListItem> = self.items.iter().map(|i| ListItem::new(*i)).collect();
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .title(" Widgets ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            )
-            .highlight_style(theme.highlight())
-            .highlight_symbol("▶ ");
-        frame.render_stateful_widget(list, area, &mut self.list_state);
-    }
-
-    fn draw_table(&mut self, frame: &mut Frame, area: Rect) {
-        let theme = *self.theme();
-        let header = Row::new(["Widget", "Kind", "Stateful"])
-            .style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD));
-        let rows = TABLE_DATA
-            .iter()
-            .map(|(a, b, c)| Row::new([Cell::from(*a), Cell::from(*b), Cell::from(*c)]));
-
-        let widths = [
-            Constraint::Percentage(40),
-            Constraint::Percentage(40),
-            Constraint::Percentage(20),
-        ];
-        let table = Table::new(rows, widths)
-            .header(header)
-            .block(
-                Block::default()
-                    .title(" Widget Catalog ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            )
-            .row_highlight_style(theme.highlight())
-            .highlight_symbol("▶ ");
-        frame.render_stateful_widget(table, area, &mut self.table_state);
-    }
-
-    fn draw_chart(&self, frame: &mut Frame, area: Rect) {
-        let theme = self.theme();
-        let phase = self.counter as f64 * 0.2;
-        let data: Vec<(f64, f64)> = (0..=100)
-            .map(|x| {
-                let xf = x as f64 / 5.0;
-                (xf, (xf + phase).sin())
-            })
-            .collect();
-        let datasets = vec![Dataset::default()
-            .name("sin(x + counter)")
-            .marker(symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(theme.series))
-            .data(&data)];
-        let chart = Chart::new(datasets)
-            .block(
-                Block::default()
-                    .title(" Chart ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            )
-            .x_axis(
-                Axis::default()
-                    .title("x")
-                    .style(Style::default().fg(theme.axis))
-                    .bounds([0.0, 20.0])
-                    .labels(["0", "10", "20"]),
-            )
-            .y_axis(
-                Axis::default()
-                    .title("y")
-                    .style(Style::default().fg(theme.axis))
-                    .bounds([-1.0, 1.0])
-                    .labels(["-1", "0", "1"]),
-            );
-        frame.render_widget(chart, area);
-    }
-
-    fn draw_live(&self, frame: &mut Frame, area: Rect) {
-        let theme = self.theme();
-        let sparkline = Sparkline::default()
-            .block(
-                Block::default()
-                    .title(" Live Sparkline (updates ~8x/sec) ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            )
-            .data(&self.spark)
-            .style(Style::default().fg(theme.series));
-        frame.render_widget(sparkline, area);
-    }
-
-    fn draw_canvas(&self, frame: &mut Frame, area: Rect) {
-        let theme = *self.theme();
-        // Marker sweeps west-to-east, wrapping around the globe.
-        let lon = -180.0 + ((self.tick as f64 * 3.0) % 360.0);
-        let canvas = Canvas::default()
-            .block(
-                Block::default()
-                    .title(" Canvas — world map ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            )
-            .marker(symbols::Marker::Braille)
-            .x_bounds([-180.0, 180.0])
-            .y_bounds([-90.0, 90.0])
-            .paint(move |ctx| {
-                ctx.draw(&Map {
-                    resolution: MapResolution::High,
-                    color: theme.series,
-                });
-                ctx.layer();
-                ctx.draw(&Circle {
-                    x: lon,
-                    y: 25.0,
-                    radius: 6.0,
-                    color: theme.value,
-                });
-                ctx.print(lon, 25.0, Span::styled("◉", Style::default().fg(theme.accent)));
-            });
-        frame.render_widget(canvas, area);
-    }
-
-    fn draw_system(&mut self, frame: &mut Frame, area: Rect) {
-        let theme = *self.theme();
-        let rows = Layout::vertical([
-            Constraint::Length(3), // cpu gauge
-            Constraint::Length(3), // memory gauge
-            Constraint::Min(5),    // cores + history | processes
-        ])
-        .split(area);
-
-        // CPU gauge
-        let cpu = self.sys.global_cpu_usage().clamp(0.0, 100.0);
-        let cpu_gauge = Gauge::default()
-            .block(Block::default().title(" CPU ").borders(Borders::ALL))
-            .gauge_style(Style::default().fg(theme.series))
-            .ratio((cpu / 100.0) as f64)
-            .label(format!("{cpu:.0}%"));
-        frame.render_widget(cpu_gauge, rows[0]);
-
-        // Memory gauge
-        let total = self.sys.total_memory().max(1);
-        let used = self.sys.used_memory();
-        let to_gb = |b: u64| b as f64 / 1_000_000_000.0;
-        let mem_gauge = Gauge::default()
-            .block(Block::default().title(" Memory ").borders(Borders::ALL))
-            .gauge_style(Style::default().fg(theme.value))
-            .ratio(used as f64 / total as f64)
-            .label(format!("{:.1} / {:.1} GB", to_gb(used), to_gb(total)));
-        frame.render_widget(mem_gauge, rows[1]);
-
-        // Bottom: left column (per-core bars + history) | processes table
-        let bottom = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
-            .split(rows[2]);
-        let left = Layout::vertical([Constraint::Min(3), Constraint::Length(8)]).split(bottom[0]);
-
-        self.draw_cores(frame, left[0], &theme);
-
-        let history = Sparkline::default()
-            .block(
-                Block::default()
-                    .title(" CPU history ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            )
-            .max(100)
-            .data(&self.cpu_history)
-            .style(Style::default().fg(theme.series));
-        frame.render_widget(history, left[1]);
-
-        self.draw_processes(frame, bottom[1], &theme);
-    }
-
-    /// One LineGauge per CPU core, fixed to a 0–100% scale.
-    fn draw_cores(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let block = Block::default()
-            .title(" Cores ")
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        let cpus = self.sys.cpus();
-        let rows = inner.height as usize;
-        let n = cpus.len().min(rows);
-        if n == 0 {
-            return;
-        }
-        let slots = Layout::vertical(vec![Constraint::Length(1); n]).split(inner);
-        for (i, cpu) in cpus.iter().take(n).enumerate() {
-            let usage = cpu.cpu_usage().clamp(0.0, 100.0);
-            let gauge = LineGauge::default()
-                .ratio((usage / 100.0) as f64)
-                .label(format!("{i:>2}"))
-                .filled_style(Style::default().fg(theme.series))
-                .unfilled_style(Style::default().fg(theme.axis));
-            frame.render_widget(gauge, slots[i]);
-        }
-    }
-
-    /// Scrollable, selectable table of all processes sorted by CPU.
-    fn draw_processes(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        self.proc_area = area;
-        let mut procs: Vec<ProcRow> = self
-            .sys
-            .processes()
-            .values()
-            .map(|p| ProcRow {
-                pid: p.pid().to_string(),
-                pid_num: p.pid().as_u32(),
-                name: p.name().to_string_lossy().to_string(),
-                cpu: p.cpu_usage(),
-                mem: p.memory(),
-                run: p.run_time(),
-                status: p.status().to_string(),
-            })
-            .collect();
-        procs.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
-        self.proc_count = procs.len();
-
-        let header = Row::new(["Process", "CPU%", "Mem"])
-            .style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD));
-        let proc_rows = procs.iter().map(|p| {
-            let short: String = p.name.chars().take(22).collect();
-            Row::new([
-                Cell::from(short),
-                Cell::from(format!("{:.0}", p.cpu)),
-                Cell::from(format!("{:.0}M", p.mem as f64 / 1_000_000.0)),
-            ])
-        });
-        let widths = [
-            Constraint::Percentage(60),
-            Constraint::Percentage(20),
-            Constraint::Percentage(20),
-        ];
-        let table = Table::new(proc_rows, widths)
-            .header(header)
-            .block(
-                Block::default()
-                    .title(" Top Processes (↑/↓ to scroll) ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            )
-            .row_highlight_style(theme.highlight())
-            .highlight_symbol("▶ ");
-        frame.render_stateful_widget(table, area, &mut self.proc_state);
-        self.proc_snapshot = procs; // keep for the detail popup
-    }
-
-    fn draw_footer(&self, frame: &mut Frame, area: Rect) {
-        let theme = self.theme();
-        let hint = match self.tab {
-            0 => "↑/↓/scroll counter   r reset",
-            1 => "↑/↓/click select   Enter details",
-            2 => "↑/↓/click select   Enter details",
-            3 => "counter shifts the wave",
-            4 => "auto-updating",
-            5 => "animated world map",
-            _ => "↑/↓ select   Enter details   k kill",
-        };
-        let footer = Paragraph::new(Line::from(vec![
-            " ? help   t theme   ".fg(theme.hint),
-            hint.fg(theme.hint),
-            "   q quit ".fg(theme.quit),
-        ]))
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
-        );
-        frame.render_widget(footer, area);
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
     /// Render the app to an in-memory buffer (no real terminal needed).
     fn render(app: &mut App) -> Buffer {
@@ -762,7 +673,7 @@ mod tests {
             (3, "sin(x + counter)"),
             (4, "Live Sparkline"),
             (5, "world map"),
-            (6, "Top Processes"),
+            (6, "Processes"),
         ];
         for (tab, needle) in cases {
             let mut app = App::new();
@@ -896,7 +807,10 @@ mod tests {
         app.handle_key_for_test('k'); // opens confirm
         let tab_before = app.tab;
         app.handle_key_for_test('\t'); // would normally switch tabs
-        assert_eq!(app.tab, tab_before, "input is captured by the confirm prompt");
+        assert_eq!(
+            app.tab, tab_before,
+            "input is captured by the confirm prompt"
+        );
         assert!(app.pending_kill.is_none(), "tab key cancelled the prompt");
     }
 
@@ -910,6 +824,92 @@ mod tests {
         app.select_at(a.x + 2, a.y + 4);
         let expected = 2.min(app.proc_count.saturating_sub(1));
         assert_eq!(app.proc_state.selected(), Some(expected));
+    }
+
+    #[test]
+    fn sort_key_cycles_and_reorders_by_pid() {
+        let mut app = App::new();
+        app.tab = 6;
+        // Cycle CPU -> Mem -> Name -> Pid.
+        for _ in 0..3 {
+            app.handle_key_for_test('s');
+        }
+        assert!(app.sort_by == SortKey::Pid);
+        render(&mut app);
+        // Sorted by PID ascending: each pid_num >= the previous.
+        let pids: Vec<u32> = app.proc_snapshot.iter().map(|p| p.pid_num).collect();
+        assert!(
+            pids.windows(2).all(|w| w[0] <= w[1]),
+            "pids should be ascending"
+        );
+    }
+
+    #[test]
+    fn filter_narrows_the_process_list() {
+        let mut app = App::new();
+        app.tab = 6;
+        render(&mut app);
+        let all = app.proc_count;
+        app.handle_key_for_test('/'); // enter filter mode
+        for c in "zzqxnope".chars() {
+            app.handle_key_for_test(c);
+        }
+        render(&mut app);
+        assert!(app.proc_count <= all, "filter only narrows the list");
+    }
+
+    #[test]
+    fn update_applies_actions_directly() {
+        let mut app = App::new();
+        app.update(Action::NextTab);
+        assert_eq!(app.tab, 1);
+        app.update(Action::CycleTheme);
+        assert_eq!(app.theme_idx, 1);
+        app.update(Action::ToggleHelp);
+        assert!(app.show_help);
+        app.update(Action::QuitOrClose); // closes help, doesn't quit
+        assert!(!app.show_help);
+        assert!(!app.exit);
+        app.update(Action::QuitOrClose); // now quits
+        assert!(app.exit);
+    }
+
+    #[test]
+    fn clicking_a_tab_selects_it() {
+        let mut app = App::new();
+        render(&mut app); // populates tab_ranges
+        // Click within the "Chart" tab (index 3) range.
+        let (start, end) = app.tab_ranges[3];
+        app.select_tab_at((start + end) / 2);
+        assert_eq!(app.tab, 3);
+    }
+
+    #[test]
+    fn refresh_rate_adjusts_within_bounds() {
+        let mut app = App::new();
+        for _ in 0..100 {
+            app.handle_key_for_test('+');
+        }
+        assert_eq!(app.refresh_ms, REFRESH_MIN_MS);
+        for _ in 0..100 {
+            app.handle_key_for_test('-');
+        }
+        assert_eq!(app.refresh_ms, REFRESH_MAX_MS);
+    }
+
+    #[test]
+    fn fmt_rate_scales_units() {
+        assert_eq!(fmt_rate(512), "512 B/s");
+        assert_eq!(fmt_rate(2_000), "2 KB/s");
+        assert_eq!(fmt_rate(3_000_000), "3.0 MB/s");
+    }
+
+    #[test]
+    fn load_color_thresholds() {
+        let t = &THEMES[0];
+        assert_eq!(load_color(t, 10.0), t.series);
+        assert_eq!(load_color(t, 60.0), Color::Yellow);
+        assert_eq!(load_color(t, 95.0), Color::Red);
     }
 
     #[test]
